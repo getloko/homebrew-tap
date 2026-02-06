@@ -1,0 +1,162 @@
+name: Update Homebrew Formula
+
+on:
+  repository_dispatch:
+    types: [homebrew-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to update to (e.g., 0.3.0)'
+        required: true
+
+jobs:
+  update-formula:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tap repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Updating formula to version $VERSION"
+
+      - name: Install homebrew-pypi-poet
+        run: pip install homebrew-pypi-poet
+
+      - name: Wait for PyPI availability
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "Waiting for loko-k8s==$VERSION to appear on PyPI..."
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/loko-k8s/${VERSION}/json")
+            if [ "$STATUS" = "200" ]; then
+              echo "Package available."
+              break
+            fi
+            echo "Not yet available (attempt $i/12), waiting 30s..."
+            sleep 30
+          done
+
+      - name: Generate resources with poet
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Install the exact version to resolve dependencies
+          pip install "loko-k8s==${VERSION}"
+
+          # Generate resource stanzas for all dependencies
+          poet loko-k8s > /tmp/resources.txt
+          echo "Generated resources:"
+          cat /tmp/resources.txt
+
+      - name: Get main package info from PyPI
+        id: pkg
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          INFO=$(curl -s "https://pypi.org/pypi/loko-k8s/${VERSION}/json")
+          SHA256=$(echo "$INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(f['digests']['sha256'] for f in d['urls'] if f['packagetype']=='sdist'))")
+          URL=$(echo "$INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(f['url'] for f in d['urls'] if f['packagetype']=='sdist'))")
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "URL: $URL"
+          echo "SHA256: $SHA256"
+
+      - name: Archive current formula as versioned
+        run: |
+          if [[ ! -f Formula/loko.rb ]]; then
+            echo "No existing formula to archive."
+            exit 0
+          fi
+
+          # Extract current version from the URL in loko.rb
+          CURRENT_VERSION=$(grep -m1 '^ *url' Formula/loko.rb | grep -o 'loko_k8s-[^/]*\.tar\.gz' | sed 's/loko_k8s-//;s/\.tar\.gz//')
+          if [[ -z "$CURRENT_VERSION" ]]; then
+            echo "Could not determine current version, skipping archive."
+            exit 0
+          fi
+
+          echo "Archiving current formula v${CURRENT_VERSION}"
+          VERSIONED_FILE="Formula/loko@${CURRENT_VERSION}.rb"
+          CLASS_NAME="LokoAT${CURRENT_VERSION//./}"
+
+          cp Formula/loko.rb "$VERSIONED_FILE"
+          sed -i "s/class Loko </class ${CLASS_NAME} </" "$VERSIONED_FILE"
+
+          # Keep only 3 versioned formulas (delete oldest beyond that)
+          mapfile -t VERSIONED < <(ls Formula/loko@*.rb 2>/dev/null | sort -V)
+          KEEP=3
+          TOTAL=${#VERSIONED[@]}
+          if [[ $TOTAL -gt $KEEP ]]; then
+            DELETE_COUNT=$((TOTAL - KEEP))
+            for i in $(seq 0 $((DELETE_COUNT - 1))); do
+              echo "Removing old formula: ${VERSIONED[$i]}"
+              git rm "${VERSIONED[$i]}"
+            done
+          fi
+
+      - name: Rebuild formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA256="${{ steps.pkg.outputs.sha256 }}"
+          URL="${{ steps.pkg.outputs.url }}"
+          RESOURCES=$(cat /tmp/resources.txt)
+
+          cat > Formula/loko.rb << FORMULA
+          class Loko < Formula
+            include Language::Python::Virtualenv
+
+            desc "Local Kubernetes Environment Manager for KinD clusters"
+            homepage "https://github.com/getloko/loko"
+            url "${URL}"
+            sha256 "${SHA256}"
+            license "MIT"
+
+            depends_on "rust" => :build
+            depends_on "libyaml"
+            depends_on "python@3.13"
+
+          ${RESOURCES}
+
+            def install
+              virtualenv_install_with_resources
+              bin.install_symlink libexec/"bin/loko"
+            end
+
+            test do
+              system bin/"loko", "--version"
+              system bin/"loko", "--help"
+              assert_match version.to_s, shell_output("#{bin}/loko --version")
+            end
+          end
+          FORMULA
+
+          echo "Updated formula:"
+          cat Formula/loko.rb
+
+      - name: Audit formula
+        run: |
+          brew tap getloko/tap $(pwd)
+          brew audit --strict loko || true
+          brew style loko || true
+
+      - name: Commit and push
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/loko.rb Formula/loko@*.rb 2>/dev/null || true
+          git commit -m "chore: update loko formula to v${VERSION}" || echo "No changes to commit"
+          git push
